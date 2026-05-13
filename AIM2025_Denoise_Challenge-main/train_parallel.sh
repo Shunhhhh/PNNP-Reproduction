@@ -1,0 +1,12 @@
+#/bin/sh
+
+
+GPUS=0,1,2,3
+NGPU_PER_NODE=4
+MAIN_SCRIPT=train_denoise.py
+OMP_THREADS=16
+PORT=29500
+
+CUDA_VISIBLE_DEVICES=$GPUS OMP_NUM_THREADS=$OMP_THREADS torchrun --nproc_per_node=$NGPU_PER_NODE --master_port=$PORT $MAIN_SCRIPT
+
+
