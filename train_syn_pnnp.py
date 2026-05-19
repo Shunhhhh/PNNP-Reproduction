@@ -1,3 +1,6 @@
+"""
+训练PNNP加噪模型
+"""
 import os
 import glob
 import torch
@@ -85,28 +88,40 @@ class ResBlock(nn.Module):
 # =========================================================
 class PPMGenerator(nn.Module):
 
-    def __init__(self, in_channels=4, nf=16):
+    def __init__(self, in_channels=4, nf=16,
+                 alpha=1.48888310e-08,
+                 beta=1.17790606e-05):
+
         super().__init__()
 
         self.in_proj = nn.Conv2d(in_channels, nf, 1)
 
-        self.iso_gain = nn.Sequential(
-            nn.Linear(1, 1),
-            nn.Softplus()
-        )
+        # calibration fitting
+        self.alpha = alpha
+        self.beta = beta
 
+        # ISO-dependent branch
         self.dep = nn.Sequential(
             nn.Conv2d(nf, nf, 1),
             nn.SiLU(),
+
             ResBlock(nf),
-            nn.Conv2d(nf, nf, 1)
+            ResBlock(nf),
+
+            nn.Conv2d(nf, nf, 1),
+            nn.SiLU()
         )
 
+        # ISO-agnostic branch
         self.agn = nn.Sequential(
             nn.Conv2d(nf, nf, 1),
             nn.SiLU(),
+
             ResBlock(nf),
-            nn.Conv2d(nf, nf, 1)
+            ResBlock(nf),
+
+            nn.Conv2d(nf, nf, 1),
+            nn.SiLU()
         )
 
         self.out_proj = nn.Conv2d(nf, in_channels, 1)
@@ -114,39 +129,89 @@ class PPMGenerator(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+
         for m in self.modules():
+
             if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.001)
+
+                nn.init.normal_(m.weight, std=1e-2)
 
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-            elif isinstance(m, nn.Linear):
-
-                nn.init.constant_(m.weight, 0.1)
-                nn.init.constant_(m.bias, -8.8)
-
     def forward(self, n1, n2, iso):
-        iso_input = torch.log2(iso.float() / 100.0).view(-1, 1)
-        gain = self.iso_gain(iso_input).view(-1, 1, 1, 1)
 
-        if self.training:
-            gain = gain * (1 + torch.randn_like(gain) * 0.05)
+        # =====================================================
+        # ISO gain from calibration
+        # =====================================================
+
+        gain = self.alpha * iso.float() + self.beta
+
+        gain = gain.view(-1, 1, 1, 1)
+
+        # =====================================================
+        # Features
+        # =====================================================
 
         n1_feat = self.in_proj(n1)
         n2_feat = self.in_proj(n2)
 
-        x = self.dep(n1_feat) * gain + self.agn(n2_feat)
+        # =====================================================
+        # Branches
+        # =====================================================
 
-        return self.out_proj(x)
+        npre = self.dep(n1_feat)
 
+        # agnostic branch 必须很弱
+        nfol = 0.02 * self.agn(n2_feat)
+
+        # =====================================================
+        # Physics prior
+        # =====================================================
+        x = npre * gain + nfol
+        x = self.out_proj(x)
+
+        return x
+
+def compare_distribution(pred, gt, iso_val, channel=0):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    p = pred[:, channel].flatten().cpu().numpy()
+    g = gt[:, channel].flatten().cpu().numpy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # 直方图
+    axes[0].hist(p, bins=200, alpha=0.5, label='pred', density=True)
+    axes[0].hist(g, bins=200, alpha=0.5, label='gt',   density=True)
+    axes[0].set_title(f'ISO {iso_val} | Channel {channel} | Histogram')
+    axes[0].legend()
+    xlim = max(np.abs(p).max(), np.abs(g).max())
+    axes[0].set_xlim(-xlim * 1.1, xlim * 1.1)
+
+    # Q-Q plot：用相同的分位数点采样，保证对齐
+    quantiles = np.linspace(0, 100, 1000)
+    p_q = np.percentile(p, quantiles)
+    g_q = np.percentile(g, quantiles)
+
+    axes[1].scatter(g_q, p_q, s=2, alpha=0.5)
+    # 用 1%~99% 分位数范围设置轴范围，避免离群点拉伸
+    lim_lo = min(np.percentile(g_q, 1),  np.percentile(p_q, 1))
+    lim_hi = max(np.percentile(g_q, 99), np.percentile(p_q, 99))
+    axes[1].plot([lim_lo, lim_hi], [lim_lo, lim_hi], 'r--', label='ideal')
+    axes[1].set_xlim(lim_lo, lim_hi)
+    axes[1].set_ylim(lim_lo, lim_hi)
+
+    plt.tight_layout()
+    plt.savefig(f'dist_iso{iso_val}.png')
 
 # =========================================================
 # Dataset
 # =========================================================
 class PPMTrainingDataset(Dataset):
 
-    def __init__(self, benchmark_dir, patch_size=512):
+    def __init__(self, benchmark_dir, patch_size=1024):
 
         self.dark_paths = glob.glob(
             os.path.join(
@@ -340,6 +405,43 @@ class PPMTrainingDataset(Dataset):
             "beta": torch.tensor(self.beta).float()
         }
 
+@torch.no_grad()
+def full_evaluation(model, dataset, device, iso_list=None):
+    model.eval()
+    if iso_list is None:
+        iso_list = sorted(dataset.shadings.keys())
+ 
+    for iso_val in iso_list:
+        indices = [i for i, p in enumerate(dataset.dark_paths)
+                   if dataset._get_iso(p) == iso_val][:4]
+        if not indices:
+            continue
+ 
+        preds, gts = [], []
+        for idx in indices:
+            data = dataset[idx]
+            raw     = data["raw"].unsqueeze(0).to(device)
+            shading = data["shading"].unsqueeze(0).to(device)
+            wl      = data["wl"].unsqueeze(0).to(device)
+            bl      = data["bl"].unsqueeze(0).to(device)
+            iso     = data["iso"].unsqueeze(0).to(device)
+ 
+            gt   = gpu_physics_pipeline(raw, shading, wl, bl)
+            n1   = torch.randn_like(gt)
+            n2   = torch.randn_like(gt)
+            pred = model(n1, n2, iso)
+ 
+            preds.append(pred)
+            gts.append(gt)
+ 
+        pred_all = torch.cat(preds)
+        gt_all   = torch.cat(gts)
+ 
+        print(f"\n{'='*40}")
+        print(f"ISO {iso_val} | PredStd={pred_all.std():.6f} | GTStd={gt_all.std():.6f}")
+        compare_distribution(pred_all, gt_all, iso_val)
+    
+
 def check_model_std(model, dataset, device, num_samples=5):
     model.eval()
     print("\n" + "="*30)
@@ -421,30 +523,94 @@ def train_noise_generator(benchmark_dir, camera, is_training, steps_per_iso=2000
     all_isos = sorted(list(full_dataset.shadings.keys()))
     
     print(f"Starting PNNP Training for {camera}...")
-    
+
+    # # # 先打印一下各ISO的实际gain值
+    # model.load_state_dict(torch.load(f"checkpoints/PNNP_noise/ppm_generator_{camera}.pth"))
+    # model.eval()
+    # with torch.no_grad():
+    #     print("=== Scale vs GT std ===")
+    #     for iso_val in sorted(full_dataset.shadings.keys()):
+    #         iso_t = torch.tensor([[float(iso_val)]], device=device)
+    #         iso_log = torch.log2(iso_t / 100.0)
+            
+    #         # 用你实际的 forward 里的 gain 计算方式
+    #         w = F.softplus(model.iso_gain[0].weight)
+    #         b = model.iso_gain[0].bias
+    #         scale = F.softplus(F.linear(iso_log, w, b)).item()
+            
+    #         # gt std
+    #         indices = [i for i, p in enumerate(full_dataset.dark_paths)
+    #                 if full_dataset._get_iso(p) == iso_val][:2]
+    #         gt_stds = []
+    #         for idx in indices:
+    #             data = full_dataset[idx]
+    #             raw = data["raw"].unsqueeze(0).to(device)
+    #             shading = data["shading"].unsqueeze(0).to(device)
+    #             wl = data["wl"].unsqueeze(0).to(device)
+    #             bl = data["bl"].unsqueeze(0).to(device)
+    #             gt = gpu_physics_pipeline(raw, shading, wl, bl)
+    #             gt_stds.append(gt.std().item())
+            
+    #         print(f"ISO {iso_val:5d} | scale={scale:.6f} | gt_std={np.mean(gt_stds):.6f} | ratio={scale/np.mean(gt_stds):.2f}")
+
+        
+
+
+
     model.train()
     for iso_val in all_isos:
+
         print(f"\n>>> Optimizing ISO {iso_val}")
-        indices = [i for i, p in enumerate(full_dataset.dark_paths) if full_dataset._get_iso(p) == iso_val]
-        if not indices: continue
-        
-        iso_loader = DataLoader(
-            Subset(full_dataset, indices), 
-            batch_size=4,          
-            shuffle=True, 
-            num_workers=8,          
-            pin_memory=True,
-            prefetch_factor=4,        
-            persistent_workers=True 
+
+        # =====================================================
+        # 每个ISO重新初始化模型
+        # =====================================================
+
+        model = PPMGenerator().to(device)
+        model.train()
+
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=1e-2
         )
-        
+
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=steps_per_iso,
+            eta_min=1e-5
+        )
+
+        indices = [
+            i for i, p in enumerate(full_dataset.dark_paths)
+            if full_dataset._get_iso(p) == iso_val
+        ]
+
+        if not indices:
+            continue
+
+        iso_loader = DataLoader(
+            Subset(full_dataset, indices),
+            batch_size=4,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            prefetch_factor=4,
+            persistent_workers=True
+        )
+
         def inf_train_gen(loader):
             while True:
                 for batch in loader:
                     yield batch
 
         data_gen = inf_train_gen(iso_loader)
-        for step in range(1, steps_per_iso+1):
+
+        # =====================================================
+        # train
+        # =====================================================
+
+        for step in range(1, steps_per_iso + 1):
+
             data = next(data_gen)
 
             raw_gpu = data["raw"].to(device, non_blocking=True)
@@ -452,102 +618,80 @@ def train_noise_generator(benchmark_dir, camera, is_training, steps_per_iso=2000
             iso = data["iso"].to(device, non_blocking=True)
             wl = data["wl"].to(device, non_blocking=True)
             bl = data["bl"].to(device, non_blocking=True)
-            alpha_val = data["alpha"].to(device)
-            beta_val = data["beta"].to(device)
 
-            if is_training:
-                alpha_pert = alpha_val * (1 + torch.randn_like(alpha_val) * 0.1)
-                beta_pert = beta_val * (1 + torch.randn_like(beta_val) * 0.1)
-            else:
-                alpha_pert, beta_pert = alpha_val, beta_val
-
-            target_noise = gpu_physics_pipeline(raw_gpu, shading_gpu, wl, bl)
+            target_noise = gpu_physics_pipeline(
+                raw_gpu,
+                shading_gpu,
+                wl,
+                bl
+            )
 
             noise_in1 = torch.randn_like(target_noise)
             noise_in2 = torch.randn_like(target_noise)
-        
-            generated_noise = model(noise_in1, noise_in2, iso)
-            
-            loss = ddl_loss(generated_noise, target_noise)
-            
+
+            generated_noise = model(
+                noise_in1,
+                noise_in2,
+                iso
+            )
+
+            loss = ddl_loss(
+                generated_noise,
+                target_noise
+            )
+
             optimizer.zero_grad()
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1) 
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                0.1
+            )
+
             optimizer.step()
             scheduler.step()
 
             if step % 200 == 0:
-                print(f"Step {step:4d} | Loss: {loss.item():.4f} | PredStd: {generated_noise.std().item():.5f} | GTStd: {target_noise.std().item():.5f}")
-            
-    os.makedirs("checkpoints/PNNP_noise", exist_ok=True)
-    torch.save(model.state_dict(), f"checkpoints/PNNP_noise/ppm_generator_{camera}.pth")
 
-    # =========================================================
-    # 6. 全局混合微调阶段 (Mixed Fine-tuning Phase)
-    # =========================================================
-    print("\n" + "="*40)
-    print(">>> Starting Global Mixed Fine-tuning Phase")
-    print("="*40)
+                print(
+                    f"Step {step:4d} | "
+                    f"Loss: {loss.item():.4f} | "
+                    f"PredStd: {generated_noise.std().item():.5f} | "
+                    f"GTStd: {target_noise.std().item():.5f}"
+                )
 
+        # =====================================================
+        # save per ISO
+        # =====================================================
 
-    iso_list = [full_dataset._get_iso(p) for p in full_dataset.dark_paths]
-    iso_counts = Counter(iso_list)
-    weights = [1.0 / iso_counts[full_dataset._get_iso(p)] for p in full_dataset.dark_paths]
-    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+        os.makedirs(
+            "checkpoints/PNNP_noise",
+            exist_ok=True
+        )
 
-    mixed_loader = DataLoader(
-        full_dataset,
-        batch_size=8,
-        sampler=sampler,          # 替换 shuffle=True
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
-    )
+        save_path = (
+            f"checkpoints/PNNP_noise/"
+            f"ppm_generator_{camera}_iso{iso_val}.pth"
+        )
 
-    # 提高学习率
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = 1e-3
+        torch.save(
+            model.state_dict(),
+            save_path
+        )
 
-    mixed_steps = 5000
-    scheduler_mixed = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=mixed_steps, eta_min=1e-5
-    )
+        print(f"\nSaved: {save_path}")
 
-    mixed_gen = inf_train_gen(mixed_loader)
+        # =====================================================
+        # evaluate current ISO only
+        # =====================================================
 
-    for step in range(1, mixed_steps + 1):
-        data = next(mixed_gen)
-
-        raw_gpu    = data["raw"].to(device, non_blocking=True)
-        shading_gpu = data["shading"].to(device, non_blocking=True)
-        iso        = data["iso"].to(device, non_blocking=True)
-        wl         = data["wl"].to(device, non_blocking=True)
-        bl         = data["bl"].to(device, non_blocking=True)
-
-        target_noise = gpu_physics_pipeline(raw_gpu, shading_gpu, wl, bl)
-
-        noise_in1 = torch.randn_like(target_noise)
-        noise_in2 = torch.randn_like(target_noise)
-        generated_noise = model(noise_in1, noise_in2, iso)
-
-        loss = ddl_loss(generated_noise, target_noise)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-        optimizer.step()
-        scheduler_mixed.step()
-
-        if step % 200 == 0:
-            # 打印每个ISO的loss，便于发现哪个ISO收敛差
-            iso_vals = iso.cpu().tolist()
-            print(f"Mixed Step {step:4d} | Loss: {loss.item():.4f} | "
-                f"ISOs: {[int(v) for v in iso_vals]} | "
-                f"PredStd: {generated_noise.std().item():.5f} | "
-                f"GTStd: {target_noise.std().item():.5f}")
-
-    torch.save(model.state_dict(), f"checkpoints/PNNP_noise/ppm_generator_{camera}_final_mixed.pth")
-    print("Training Complete.")
+        full_evaluation(
+            model,
+            full_dataset,
+            device,
+            [iso_val]
+        )
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
+"""
+PNNP加噪+ELD去噪
+"""
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -29,12 +32,20 @@ def build_dataloaders(args):
 
     benchmark_dir = os.path.join(args.benchmark_dir, args.camera)
 
+    ppm_model_paths = {
+        800:  f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso800.pth",
+        1250: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso1250.pth",
+        1600: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso1600.pth",
+        3200: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso3200.pth",
+        6400: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso6400.pth",
+    }
+
     full_set = NoiseSynthesisDataset(
-        model_path=f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}.pth",
+        model_dir=ppm_model_paths,
         clean_raw_dir=args.clean_img_dir,
         benchmark_dir=benchmark_dir,
         camera_config=cam_cfg,
-        iso_list=[800, 1600, 3200],
+        iso_list=[800, 1250, 1600, 3200, 6400],
         dgain_range=args.train_dgain_range,
         patch_size=args.train_patch_size,
         inp_clip_low=False,
@@ -84,12 +95,7 @@ def train_one_ep(model, train_loader, optimizer, criterion, device):
 
 
         optimizer.zero_grad()
-
         denoised = model(noisy)
-        # denoised = torch.clamp(denoised, 0, 1)
-        # clean    = torch.clamp(clean,    0, 1)
-
-        # loss = criterion(denoised, clean)
 
         loss = criterion(denoised, clean)  # clean 已是[0,1]
 
@@ -209,11 +215,11 @@ if __name__ == "__main__":
     parser.add_argument("--n_epoch", type=int, default=500)
     parser.add_argument("--train_patch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--bs", type=int, default=64)
+    parser.add_argument("--bs", type=int, default=32)
     parser.add_argument("--n_crop_per_img", type=int, default=4)
     parser.add_argument("--train_dgain_range", type=list, default=[10.0, 200.0])
     parser.add_argument("--camera", type=str, default="sonyzve10m2")
-    parser.add_argument("--clean_img_dir", type=str, default="../../data/xml196414/SID/Sony_npy/long")
+    parser.add_argument("--clean_img_dir", type=str, default="../../data/xml196414/SID/Sony/long")
     parser.add_argument("--benchmark_dir", type=str, default="../../data/xml196414/SID/dev_phase_release")
     parser.add_argument("--seed", type=int, default=0)
 

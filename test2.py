@@ -1,3 +1,6 @@
+"""
+可视化加噪结果
+"""
 import os
 import torch
 import numpy as np
@@ -38,15 +41,6 @@ dataset = NoiseSynthesisDataset(
     black_level   = 512.0,
 )
 
-# model = dataset.model
-# model.eval()
-# with torch.no_grad():
-#     for iso in [800, 1600, 3200, 6400]:
-#         iso_t = torch.tensor([[float(iso)]])
-#         iso_input = torch.log2(iso_t / 100.0)
-#         gain = model.iso_gain(iso_input)
-#         print(f"ISO={iso} | log2(iso/100)={iso_input.item():.3f} | gain={gain.item():.6f}")
-
 
 # dataset = SynthTrainDataset(
 #     clean_img_dir = CLEAN_RAW_DIR,
@@ -81,7 +75,7 @@ def simple_isp(packed, wb=None, ccm=None, gamma=2.2):
         packed = packed * wb
         packed = torch.clamp(packed, 0, 1)
 
-    # ── 2. Demosaic（简单双线性，把4通道还原成全分辨率）──
+    # ── 2. Demosaic──
     # R=ch0, Gr=ch1, Gb=ch2, B=ch3
     # 还原为 [H*2, W*2] Bayer，再取 R Gr+Gb G B
     full = torch.zeros(H * 2, W * 2)
