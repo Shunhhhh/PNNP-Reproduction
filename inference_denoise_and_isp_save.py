@@ -95,20 +95,25 @@ def build_dataset(args):
 
     benchmark_dir = os.path.join(args.benchmark_dir, args.camera)
 
+    ppm_model_paths = {
+        800:  f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso800.pth",
+        1250: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso1250.pth",
+        1600: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso1600.pth",
+        3200: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso3200.pth",
+        6400: f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}_iso6400.pth",
+    }
+
     dataset = NoiseSynthesisDataset(
-        model_path=f"./checkpoints/PNNP_noise/ppm_generator_{args.camera}.pth",
+        model_dir=ppm_model_paths,
         clean_raw_dir=args.clean_img_dir,
         benchmark_dir=benchmark_dir,
         camera_config=cam_cfg,
-
-        # ===== inference关键 =====
-        iso_list=[args.iso],
-        dgain_range=[args.dgain],
-        patch_size=args.patch_size,
-        n_crop_per_img=1,
-
+        iso_list=[800, 1250, 1600, 3200, 6400],
+        dgain_range=args.dgain,
+        patch_size=512,
         inp_clip_low=False,
         inp_clip_high=True,
+        n_crop_per_img=4,
     )
 
     return dataset, cam_cfg
@@ -200,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera", type=str, default="sonyzve10m2")
 
     parser.add_argument("--clean_img_dir", type=str,
-                        default="../../data/xml196414/SID/Sony_npy/long")
+                        default="../../data/xml196414/SID/Sony/long")
 
     parser.add_argument("--benchmark_dir", type=str,
                         default="../../data/xml196414/SID/dev_phase_release")
@@ -209,7 +214,7 @@ if __name__ == "__main__":
 
     # ===== noise control =====
     parser.add_argument("--iso", type=int, default=800)
-    parser.add_argument("--dgain", type=float, default=100.0)
+    parser.add_argument("--dgain", type=float, default=(10.0, 200.0))
     parser.add_argument("--patch_size", type=int, default=256)
 
     parser.add_argument("--seed", type=int, default=0)

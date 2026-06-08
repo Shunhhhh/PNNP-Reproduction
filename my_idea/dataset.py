@@ -1,0 +1,266 @@
+import os
+import glob
+import rawpy
+import random
+import torch
+import numpy as np
+
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+from train_syn_pnnp import PPMGenerator
+from my_idea.tools import estimate_noise_params
+
+class NoiseSynthesisDataset(Dataset):
+
+    def __init__(
+        self,
+        clean_raw_dir,
+        benchmark_dir,
+        model_dir,
+        camera_config,
+        iso_list=[800, 1250, 1600, 3200, 6400],
+        dgain_range=(10, 200),
+        patch_size=512,
+        inp_clip_low=False,
+        inp_clip_high=True,
+        n_crop_per_img=8,
+    ):
+        # ── 直接搜 ARW，和 SynthTrainDataset 保持一致 ──
+        self.clean_paths = sorted(
+            glob.glob(os.path.join(clean_raw_dir, "*.ARW"))
+        )
+        print("Found clean ARW:", len(self.clean_paths))
+
+        self.iso_list       = iso_list
+        self.dgain_range    = dgain_range
+        self.patch_size     = patch_size
+        self.clip_low       = 0   if inp_clip_low  else float("-inf")
+        self.clip_high      = 1   if inp_clip_high else float("inf")
+        self.n_crop_per_img = n_crop_per_img
+        self.camera_config  = camera_config
+
+        self.transforms = transforms.Compose([
+            transforms.RandomVerticalFlip(0.5),
+            transforms.RandomHorizontalFlip(0.5),
+        ])
+
+        # =====================================================
+        # Load shading maps（ADU域，和 SynthTrainDataset 一致）
+        # =====================================================
+        self.shadings = {}
+        calib_path = os.path.join(benchmark_dir, "calib_res")
+
+        for f in glob.glob(os.path.join(calib_path, "dark_shading_iso*.npy")):
+            iso_val = int(
+                os.path.basename(f).split("iso")[-1].split(".")[0]
+            )
+            self.shadings[iso_val] = np.load(f).astype(np.float32)  # [H, W]，ADU
+
+        # =====================================================
+        # Band noise calibration
+        # =====================================================
+        self.band_params = self._calibrate_band_noise(benchmark_dir)
+
+        # =====================================================
+        # Load per-ISO PPMGenerator models
+        # =====================================================
+        self.models = {}
+        print("\nLoading per-ISO PPMGenerators")
+        print("--------------------------------")
+        for iso_val in self.iso_list:
+            ckpt_path = model_dir[iso_val]
+            print(f"Loading: {ckpt_path}")
+            model = PPMGenerator(in_channels=4, nf=16)
+            model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+            model.eval()
+            self.models[iso_val] = model
+        print("All ISO models loaded.")
+
+    # =========================================================
+    # pack_raw：和 SynthTrainDataset 完全一致
+    # =========================================================
+    def pack_raw(self, img, wl, bl, norm=False, clip=False):
+        out = np.stack([
+            img[0::2, 0::2],
+            img[0::2, 1::2],
+            img[1::2, 0::2],
+            img[1::2, 1::2],
+        ], axis=-1)                          # [H/2, W/2, 4]
+        out = (out - bl) / (wl - bl) if norm else out
+        out = np.clip(out, 0, 1) if clip else out
+        return out.astype(np.float32)
+
+    def random_crop(self, img, psize, n_crop=1):
+        """img: [H, W, C] numpy"""
+        res = []
+        for _ in range(n_crop):
+            hs = np.random.randint(0, img.shape[0] - psize + 1)
+            ws = np.random.randint(0, img.shape[1] - psize + 1)
+            res.append(img[hs:hs + psize, ws:ws + psize, :])
+        return np.stack(res, axis=0)         # [n, psize, psize, C]
+
+    # =========================================================
+    # Band noise calibration（从 dark_frame_npz 读取）
+    # =========================================================
+    def _calibrate_band_noise(self, benchmark_dir):
+
+        dark_paths = glob.glob(
+            os.path.join(benchmark_dir, "dark_frame_npz/**/*.npz"),
+            recursive=True
+        )
+
+        iso_to_row, iso_to_col, iso_to_pixel = {}, {}, {}
+
+        for path in dark_paths:
+            data    = np.load(path)
+            raw_adu = data["raw"].astype(np.float32)   # ADU, full sensor
+            iso_val = self._get_iso(path)
+
+            # 找最近的 shading iso
+            target_iso       = min(self.shadings.keys(), key=lambda x: abs(x - iso_val))
+            shading_full_adu = self.shadings[target_iso]   # [H_full, W_full]
+
+            # 元信息
+            y1 = (int(data["top_margin"])  // 2) * 2
+            x1 = (int(data["left_margin"]) // 2) * 2
+            h  = int(data["height"])
+            w  = int(data["width"])
+
+            bl = float(data["black_level"])
+            wl = float(data["white_level"])
+
+            # 裁剪到有效区域，减 bl 和 shading，归一化
+            raw_roi     = raw_adu[y1:y1 + h, x1:x1 + w]
+            shading_roi = shading_full_adu[y1:y1 + h, x1:x1 + w]
+            noise       = (raw_roi - bl - shading_roi) / (wl - bl + 1e-8)
+
+            # pack 成 [4, H/2, W/2]
+            noise_packed = np.stack([
+                noise[0::2, 0::2],
+                noise[0::2, 1::2],
+                noise[1::2, 0::2],
+                noise[1::2, 1::2],
+            ], axis=0)
+            noise_t = torch.from_numpy(noise_packed)   # [4, H/2, W/2]
+
+            row_band      = noise_t.mean(dim=-1, keepdim=True)
+            row_band_zero = row_band - row_band.mean(dim=-2, keepdim=True)
+            sigma_row     = row_band_zero.std().item()
+
+            residual      = noise_t - row_band
+            col_band      = residual.mean(dim=-2, keepdim=True)
+            col_band_zero = col_band - col_band.mean(dim=-1, keepdim=True)
+            sigma_col     = col_band_zero.std().item()
+
+            pixel_noise   = residual - col_band
+            sigma_pixel   = pixel_noise.std().item()
+
+            iso_to_row.setdefault(iso_val, []).append(sigma_row)
+            iso_to_col.setdefault(iso_val, []).append(sigma_col)
+            iso_to_pixel.setdefault(iso_val, []).append(sigma_pixel)
+
+        band_params = {}
+        print("\nBand Noise Calibration")
+        print("----------------------")
+        for iso_val in sorted(iso_to_row.keys()):
+            r = float(np.mean(iso_to_row[iso_val]))
+            c = float(np.mean(iso_to_col[iso_val]))
+            p = float(np.mean(iso_to_pixel[iso_val]))
+            band_params[iso_val] = {"row": r, "col": c, "pixel": p}
+            print(f"ISO {iso_val:5d} | row={r:.6e} | col={c:.6e} | pixel={p:.6e}")
+
+        return band_params
+
+    def _get_iso(self, path):
+        for p in path.split(os.sep):
+            if "iso" in p.lower():
+                return int("".join(filter(str.isdigit, p)))
+        return 800
+
+    # =========================================================
+    # Length
+    # =========================================================
+    def __len__(self):
+        return len(self.clean_paths) * len(self.iso_list)
+
+    # =========================================================
+    # Main pipeline
+    # =========================================================
+    @torch.no_grad()
+    def __getitem__(self, idx):
+        img_idx = idx % len(self.clean_paths)
+        iso     = self.iso_list[idx // len(self.clean_paths)]
+
+        ppm_model = self.models[iso]
+
+        # STEP 1: 读 ARW
+        raw_file = rawpy.imread(self.clean_paths[img_idx])
+        wl = float(raw_file.white_level)
+        bl = float(np.mean(raw_file.black_level_per_channel))
+
+        raw_np = np.array(raw_file.raw_image_visible).astype(np.float32)
+        clean  = self.pack_raw(raw_np, wl=wl, bl=bl, norm=True, clip=True)
+
+        # crop + augment
+        clean_crops = self.random_crop(clean, psize=self.patch_size, n_crop=self.n_crop_per_img)
+        clean_crops = torch.FloatTensor(clean_crops).permute(0, 3, 1, 2)
+        clean_crops = self.transforms(clean_crops)
+
+        # band noise sigma
+        nearest_iso = min(self.band_params.keys(), key=lambda x: abs(x - iso))
+        b_sigma_row = self.band_params[nearest_iso]["row"]
+        b_sigma_col = self.band_params[nearest_iso]["col"]
+
+        # STEP 2: 每个 crop 加噪 + 估计噪声参数
+        all_noisy  = []
+        all_dgain  = []
+        all_alpha  = []
+        all_sigma2 = []
+
+        for i in range(self.n_crop_per_img):
+
+            clean_crop = clean_crops[i]  # (4, H, W)
+
+            dgain = float(np.random.randint(
+                int(self.dgain_range[0]),
+                int(self.dgain_range[1])
+            ))
+
+            img_adu = clean_crop * (wl - bl) / dgain
+
+            n1 = torch.randn_like(clean_crop).unsqueeze(0)
+            n2 = torch.randn_like(clean_crop).unsqueeze(0)
+            iso_tensor = torch.tensor([[float(iso)]], dtype=torch.float32)
+
+            gen_noise     = ppm_model(n1, n2, iso_tensor).squeeze(0)
+            gen_noise_adu = gen_noise * (wl - bl)
+
+            row_noise = torch.randn(clean_crop.shape[0], clean_crop.shape[1], 1) * b_sigma_row
+            col_noise = torch.randn(clean_crop.shape[0], 1, clean_crop.shape[2]) * b_sigma_col
+            band_noise_adu = (row_noise + col_noise) * (wl - bl)
+
+            noisy_adu = img_adu + gen_noise_adu + band_noise_adu
+            noisy     = noisy_adu / (wl - bl) * dgain
+
+            # 对这个 crop 估计噪声参数
+            G1 = noisy[1].cpu().numpy().astype(np.float64)
+            G2 = noisy[2].cpu().numpy().astype(np.float64)
+
+            
+            alpha, sigma2, _ = estimate_noise_params(G1, G2)
+
+            all_noisy.append(noisy.cpu())
+            all_dgain.append(dgain)
+            all_alpha.append(alpha)
+            all_sigma2.append(sigma2)
+
+        return {
+            "cam_model": self.camera_config,
+            "iso":       torch.ones((1,)) * iso,
+            "dgain":     torch.tensor(all_dgain,  dtype=torch.float32),
+            "noisy":     torch.clamp(torch.stack(all_noisy), self.clip_low, self.clip_high),
+            "clean":     torch.clamp(clean_crops, 0, 1),
+            "alpha":     torch.tensor(all_alpha,  dtype=torch.float32),  # (n_crop,)
+            "sigma2":    torch.tensor(all_sigma2, dtype=torch.float32),  # (n_crop,)
+        }

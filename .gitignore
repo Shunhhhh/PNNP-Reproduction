@@ -172,3 +172,15 @@ __pycache__/
 
 # crash
 core.*
+
+*.png
+*.jpg
+*.jpeg
+vis_rgb/
+vis_rgb_row_noise/
+
+# 忽略所有模型权重
+*.pth
+*.pt
+*.ckpt
+checkpoints/
